@@ -1,0 +1,14 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated benchmark results
+benchmark_output/
+
+# Ignore generated plots and data files
+*.png
+*.csv
+
+# Keep figures explicitly placed in the figures folder
+!figures/
+!figures/*.png
