@@ -1,0 +1,279 @@
+"""
+Week 4 - 3D chip thermal model: 3D visualisation (FEniCSx / dolfinx >= 0.10)
+ 
+Same model and power map as chip3d_power_map_vs_analytical.py. Solves once on 40x40x8 and draws
+ 
+  Figure 1  slide_style_surfaces.png   (like Sapatnekar EE8301 slide 33)
+            power density / FEM temperature / FEM - analytical, as 3D surface plots
+  Figure 2  chip_3d_view.png
+            (a) the whole silicon die as a 3D block, coloured by temperature
+                (thickness stretched x10 so it is visible)
+            (b) vertical cut through both cores (y = 7.5 mm): how heat spreads
+                from the DEVICE_FACE down to the BACKSIDE_FACE
+  File      chip_temperature.xdmf / .h5   -> open in ParaView for free 3D rotation, slices, isosurfaces
+ 
+DEVICE_FACE is drawn on TOP in the 3D view so the hot spots are visible.
+(In a real flip-chip package this face points down towards the solder bumps.)
+"""
+import time
+ 
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib.colors import Normalize, TwoSlopeNorm
+ 
+# ------------------------------------------------------------------
+# 1. Parameters (SI units) - identical to chip3d_power_map_vs_analytical.py
+# ------------------------------------------------------------------
+MM = 1e-3
+W_PER_CM2 = 1e4
+ 
+CHIP_LENGTH_X = 10 * MM
+CHIP_LENGTH_Y = 10 * MM
+CHIP_THICKNESS = 0.5 * MM
+ 
+K_SILICON = 150.0
+H_HEATSINK = 1.0e4
+T_AMBIENT = 0.0
+ 
+POWER_BLOCKS = {
+    "CORE_LEFT":  (1 * MM, 4 * MM, 5 * MM, 9 * MM, 150 * W_PER_CM2),
+    "CORE_RIGHT": (6 * MM, 9 * MM, 5 * MM, 9 * MM, 150 * W_PER_CM2),
+    "CACHE":      (1 * MM, 9 * MM, 1 * MM, 4 * MM,  30 * W_PER_CM2),
+}
+BACKGROUND_POWER_DENSITY = 5 * W_PER_CM2
+ 
+CELLS_X, CELLS_Y, CELLS_Z = 40, 40, 8
+SERIES_TERMS = 400
+SLICE_Y = 7.5 * MM                 # vertical cut through the hottest row
+Z_STRETCH = 10                     # visual exaggeration of the thickness in the 3D block view
+ 
+a, b, d = CHIP_LENGTH_X, CHIP_LENGTH_Y, CHIP_THICKNESS
+ 
+ 
+# ------------------------------------------------------------------
+# 2. Analytical cosine series (now at any depth z)
+# ------------------------------------------------------------------
+def cosine_integral(m, lo, hi, length):
+    m = np.asarray(m, dtype=float)
+    out = np.empty_like(m)
+    zero = m == 0
+    out[zero] = hi - lo
+    mm = m[~zero]
+    out[~zero] = length / (mm * np.pi) * (np.sin(mm * np.pi * hi / length) - np.sin(mm * np.pi * lo / length))
+    return out
+ 
+ 
+def power_coefficients(n_terms):
+    m = np.arange(n_terms)
+    P = np.zeros((n_terms, n_terms))
+    P[0, 0] = BACKGROUND_POWER_DENSITY * a * b
+    for (x0, x1, y0, y1, p) in POWER_BLOCKS.values():
+        P += (p - BACKGROUND_POWER_DENSITY) * np.outer(cosine_integral(m, x0, x1, a),
+                                                      cosine_integral(m, y0, y1, b))
+    eps = np.where(m == 0, 1.0, 2.0)
+    return P * np.outer(eps, eps) / (a * b)
+ 
+ 
+def modal_response(n_terms, z):
+    """Temperature rise at depth z per unit power density of mode (m, n).
+       G(z) = [cosh(lam (d-z)) + h/(k lam) sinh(lam (d-z))] / [k lam sinh(lam d) + h cosh(lam d)]"""
+    m = np.arange(n_terms)
+    lam = np.sqrt(np.add.outer((m * np.pi / a) ** 2, (m * np.pi / b) ** 2))
+    k, h = K_SILICON, H_HEATSINK
+    G = np.empty_like(lam)
+    pos = lam > 0
+    L = lam[pos]
+    s = d - z                                   # distance from the BACKSIDE_FACE
+    G[pos] = (np.cosh(L * s) + h / (k * L) * np.sinh(L * s)) / (k * L * np.sinh(L * d) + h * np.cosh(L * d))
+    G[~pos] = s / k + 1 / h
+    return G
+ 
+ 
+def analytical_on_grid(xs, ys, z, n_terms=SERIES_TERMS):
+    """Analytical T - T_amb on the tensor grid xs x ys at depth z -> array (len(xs), len(ys))."""
+    m = np.arange(n_terms)
+    coeff = power_coefficients(n_terms) * modal_response(n_terms, z)
+    cos_x = np.cos(np.outer(xs, m) * np.pi / a)
+    cos_y = np.cos(np.outer(ys, m) * np.pi / b)
+    return T_AMBIENT + cos_x @ coeff @ cos_y.T
+ 
+ 
+def power_density_on_grid(xs, ys):
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    P = np.full_like(X, BACKGROUND_POWER_DENSITY)
+    for (x0, x1, y0, y1, p) in POWER_BLOCKS.values():
+        P[(X >= x0) & (X <= x1) & (Y >= y0) & (Y <= y1)] = p
+    return P
+ 
+ 
+# ------------------------------------------------------------------
+# 3. FEM solve; returns the temperature on the structured node grid T[ix, iy, iz]
+# ------------------------------------------------------------------
+def solve_fem():
+    import ufl
+    from mpi4py import MPI
+    from dolfinx import mesh, fem, io, default_scalar_type
+    from dolfinx.fem.petsc import LinearProblem
+ 
+    comm = MPI.COMM_WORLD
+    t_start = time.perf_counter()
+    domain = mesh.create_box(
+        comm, [np.array([0.0, 0.0, 0.0]), np.array([a, b, d])],
+        [CELLS_X, CELLS_Y, CELLS_Z], cell_type=mesh.CellType.tetrahedron,
+    )
+    fdim = 2
+    domain.topology.create_connectivity(fdim, 3)
+    DEVICE_FACE, BACKSIDE_FACE = 1, 2
+    facet_ids, facet_vals = [], []
+    for marker, locator in [(DEVICE_FACE, lambda x: np.isclose(x[2], 0.0)),
+                            (BACKSIDE_FACE, lambda x: np.isclose(x[2], d))]:
+        facets = mesh.locate_entities_boundary(domain, fdim, locator)
+        facet_ids.append(facets)
+        facet_vals.append(np.full_like(facets, marker))
+    facet_ids = np.hstack(facet_ids).astype(np.int32)
+    facet_vals = np.hstack(facet_vals).astype(np.int32)
+    order = np.argsort(facet_ids)
+    face_tags = mesh.meshtags(domain, fdim, facet_ids[order], facet_vals[order])
+    ds = ufl.Measure("ds", domain=domain, subdomain_data=face_tags)
+ 
+    x = ufl.SpatialCoordinate(domain)
+    power_density = fem.Constant(domain, default_scalar_type(BACKGROUND_POWER_DENSITY))
+    for (x0, x1, y0, y1, p) in POWER_BLOCKS.values():
+        inside = ufl.And(ufl.And(ufl.ge(x[0], x0), ufl.le(x[0], x1)),
+                         ufl.And(ufl.ge(x[1], y0), ufl.le(x[1], y1)))
+        power_density = power_density + ufl.conditional(inside, p - BACKGROUND_POWER_DENSITY, 0.0)
+ 
+    V = fem.functionspace(domain, ("Lagrange", 1))
+    T = ufl.TrialFunction(V)
+    v = ufl.TestFunction(V)
+    k = fem.Constant(domain, default_scalar_type(K_SILICON))
+    h = fem.Constant(domain, default_scalar_type(H_HEATSINK))
+    T_amb = fem.Constant(domain, default_scalar_type(T_AMBIENT))
+    F = (k * ufl.dot(ufl.grad(T), ufl.grad(v)) * ufl.dx
+         + h * (T - T_amb) * v * ds(BACKSIDE_FACE)
+         - power_density * v * ds(DEVICE_FACE))
+    problem = LinearProblem(
+        ufl.lhs(F), ufl.rhs(F), bcs=[],
+        petsc_options_prefix="chip3d_visualize_",
+        petsc_options={"ksp_type": "cg", "pc_type": "gamg", "ksp_rtol": 1e-12},
+    )
+    T_solution = problem.solve()
+    T_solution.name = "temperature_rise"
+    runtime = time.perf_counter() - t_start
+ 
+    # Full 3D field for ParaView
+    with io.XDMFFile(comm, "chip_temperature.xdmf", "w") as xdmf:
+        xdmf.write_mesh(domain)
+        xdmf.write_function(T_solution)
+ 
+    # create_box nodes lie on a regular lattice -> put P1 values into T_grid[ix, iy, iz]
+    coords = V.tabulate_dof_coordinates()
+    ix = np.rint(coords[:, 0] / (a / CELLS_X)).astype(int)
+    iy = np.rint(coords[:, 1] / (b / CELLS_Y)).astype(int)
+    iz = np.rint(coords[:, 2] / (d / CELLS_Z)).astype(int)
+    T_grid = np.full((CELLS_X + 1, CELLS_Y + 1, CELLS_Z + 1), np.nan)
+    T_grid[ix, iy, iz] = T_solution.x.array.real
+    return T_grid, runtime
+ 
+ 
+# ------------------------------------------------------------------
+# 4. Plots
+# ------------------------------------------------------------------
+def make_plots(T_grid, runtime):
+    xs = np.linspace(0, a, CELLS_X + 1)
+    ys = np.linspace(0, b, CELLS_Y + 1)
+    zs = np.linspace(0, d, CELLS_Z + 1)
+    X, Y = np.meshgrid(xs / MM, ys / MM, indexing="ij")
+ 
+    T_device = T_grid[:, :, 0]
+    T_exact = analytical_on_grid(xs, ys, 0.0)
+    err = T_device - T_exact
+ 
+    # ---------------- Figure 1: slide-style surfaces ----------------
+    fig = plt.figure(figsize=(14, 11), layout="constrained")
+ 
+    ax = fig.add_subplot(2, 2, 1, projection="3d")
+    px = np.linspace(0, a, 201)
+    PX, PY = np.meshgrid(px / MM, px / MM, indexing="ij")
+    Pd = power_density_on_grid(px, px) / W_PER_CM2
+    ax.plot_surface(PX, PY, Pd, cmap="jet", rstride=2, cstride=2, linewidth=0, antialiased=False)
+    ax.set_zlabel("Power density (W/cm²)")
+    ax.set_title("Power map on DEVICE_FACE")
+ 
+    ax = fig.add_subplot(2, 2, 2, projection="3d")
+    ax.plot_surface(X, Y, T_device, cmap="jet", linewidth=0.2, edgecolor="k", alpha=0.95)
+    ax.set_zlabel("T - Ta (°C)")
+    ax.set_title(f"FEM temperature on DEVICE_FACE   max = {T_device.max():.2f} °C")
+ 
+    ax = fig.add_subplot(2, 2, 3, projection="3d")
+    ax.plot_surface(X, Y, err, cmap="coolwarm", linewidth=0.2, edgecolor="k",
+                    norm=TwoSlopeNorm(0.0, -max(np.abs(err).max(), 1e-12), max(np.abs(err).max(), 1e-12)))
+    ax.set_zlabel("ΔT (°C)")
+    ax.set_title("FEM - analytical")
+ 
+    for ax in fig.axes:
+        ax.set_xlabel("x (mm)")
+        ax.set_ylabel("y (mm)")
+        ax.view_init(elev=28, azim=-125)
+ 
+    ax = fig.add_subplot(2, 2, 4)
+    ax.axis("off")
+    ax.text(0.05, 0.75, f"Mesh: {CELLS_X} x {CELLS_Y} x {CELLS_Z} tetrahedral (FEniCSx)", fontsize=14)
+    ax.text(0.05, 0.60, f"FEM solve time: {runtime * 1e3:.0f} ms", fontsize=14)
+    ax.text(0.05, 0.45, f"Peak rise: FEM {T_device.max():.3f} °C, analytical {T_exact.max():.3f} °C", fontsize=14)
+    ax.text(0.05, 0.30, f"max |FEM - analytical| = {np.abs(err).max():.3f} °C "
+                        f"({np.abs(err).max() / T_exact.max() * 100:.2f} % of peak)", fontsize=14)
+    fig.savefig("slide_style_surfaces.png", dpi=200)
+ 
+    # ---------------- Figure 2: real 3D view + vertical cut ----------------
+    fig = plt.figure(figsize=(15, 6.5), layout="constrained")
+    norm = Normalize(np.nanmin(T_grid), np.nanmax(T_grid))
+    cmap = cm.hot
+ 
+    ax = fig.add_subplot(1, 2, 1, projection="3d")
+    height = lambda iz: (d - zs[iz]) / MM * Z_STRETCH        # DEVICE_FACE (iz = 0) on top
+    # top: DEVICE_FACE
+    ax.plot_surface(X, Y, np.full_like(X, height(0)), facecolors=cmap(norm(T_grid[:, :, 0])),
+                    rstride=1, cstride=1, shade=False, linewidth=0)
+    # side facing the viewer: y = Ly (the side next to both cores)
+    XZ, ZZ = np.meshgrid(xs / MM, [height(i) for i in range(CELLS_Z + 1)], indexing="ij")
+    ax.plot_surface(XZ, np.full_like(XZ, b / MM), ZZ, facecolors=cmap(norm(T_grid[:, -1, :])),
+                    rstride=1, cstride=1, shade=False, linewidth=0)
+    # right: x = Lx
+    YZ, ZZ2 = np.meshgrid(ys / MM, [height(i) for i in range(CELLS_Z + 1)], indexing="ij")
+    ax.plot_surface(np.full_like(YZ, a / MM), YZ, ZZ2, facecolors=cmap(norm(T_grid[-1, :, :])),
+                    rstride=1, cstride=1, shade=False, linewidth=0)
+    ax.set_box_aspect((a / MM, b / MM, d / MM * Z_STRETCH))
+    ax.view_init(elev=30, azim=55)
+    ax.set_xlabel("x (mm)")
+    ax.set_ylabel("y (mm)")
+    ax.set_zticks([0, d / MM * Z_STRETCH])
+    ax.set_zticklabels(["BACKSIDE", "DEVICE"])
+    ax.set_title(f"Silicon die, temperature on the outer faces\n(thickness drawn x{Z_STRETCH})")
+    fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.6, label="T - Ta (°C)")
+ 
+    ax = fig.add_subplot(1, 2, 2)
+    iy_cut = int(np.rint(SLICE_Y / (b / CELLS_Y)))
+    XC, ZC = np.meshgrid(xs / MM, zs / MM, indexing="ij")
+    cf = ax.contourf(XC, ZC, T_grid[:, iy_cut, :], levels=40, cmap="hot")
+    ax.contour(XC, ZC, T_grid[:, iy_cut, :], levels=12, colors="k", linewidths=0.4)
+    for name in ("CORE_LEFT", "CORE_RIGHT"):
+        x0, x1 = POWER_BLOCKS[name][0] / MM, POWER_BLOCKS[name][1] / MM
+        ax.plot([x0, x1], [0, 0], color="cyan", lw=4, clip_on=False)
+        ax.text((x0 + x1) / 2, -0.03, name, color="tab:blue", ha="center", va="bottom", fontsize=9)
+    ax.invert_yaxis()                                   # DEVICE_FACE (z = 0) on top
+    ax.set_aspect(8)                                    # thickness stretched x8
+    ax.set_xlabel("x (mm)")
+    ax.set_ylabel("z (mm)\ntop = DEVICE\nbottom = BACKSIDE")
+    ax.set_title(f"Vertical cut at y = {SLICE_Y / MM:.1f} mm (thickness drawn x8)", pad=28)
+    fig.colorbar(cf, ax=ax, shrink=0.6, label="T - Ta (°C)")
+    fig.savefig("chip_3d_view.png", dpi=200)
+    plt.show()
+ 
+ 
+if __name__ == "__main__":
+    T_grid, runtime = solve_fem()
+    print(f"FEM solve: {runtime:.2f} s,  peak rise {np.nanmax(T_grid):.3f} degC")
+    print("Wrote chip_temperature.xdmf (+ .h5) for ParaView")
+    make_plots(T_grid, runtime)
